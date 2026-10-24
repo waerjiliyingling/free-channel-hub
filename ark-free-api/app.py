@@ -44,6 +44,24 @@ POLL_MS = 250
 
 bearer = HTTPBearer(auto_error=False)
 
+# 图标行无文字属性，靠结构定位：'其他登录方式'标签下方图标按 x 排序，微信是第 2 个（邮箱、微信、飞书…）
+CLICK_WX_ICON_JS = """() => {
+    const label = Array.from(document.querySelectorAll('*')).find(
+        el => el.childElementCount === 0 && /其他登录方式/.test(el.textContent || ''));
+    if (!label) return 'no-label';
+    const labelR = label.getBoundingClientRect();
+    let container = label.parentElement;
+    for (let up = 0; up < 3 && container; up++) {
+        const icons = Array.from(container.querySelectorAll('[class*="icon" i], svg, img'))
+            .map(el => ({el, r: el.getBoundingClientRect()}))
+            .filter(x => x.r.width > 8 && x.r.height > 8 && x.r.y >= labelR.y)
+            .sort((a, b) => a.r.x - b.r.x);
+        if (icons.length >= 3) { icons[1].el.click(); return 'clicked:' + icons.length; }
+        container = container.parentElement;
+    }
+    return 'not-found';
+}"""
+
 
 class Message(BaseModel):
     role: str = "user"
@@ -77,7 +95,8 @@ class BrowserManager:
                 self._ctx = await self._pw.chromium.launch_persistent_context(
                     user_data_dir="/app/browser-profile",
                     headless=os.getenv("HEADLESS", "1") == "1",
-                    args=["--disable-blink-features=AutomationControlled"],
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--no-sandbox", "--disable-dev-shm-usage"],
                     viewport={"width": 1440, "height": 900},
                     locale="zh-CN",
                 )
@@ -89,20 +108,163 @@ class BrowserManager:
                 self._watchdog_task = asyncio.create_task(self._login_watchdog())
         return self.page
 
+    async def _find_qr_page(self):
+        """微信登录常弹独立窗口；在所有页面里找含扫码提示的那个"""
+        try:
+            for p in self._ctx.pages:
+                try:
+                    txt = await p.evaluate("document.body ? document.body.innerText.slice(0, 800) : ''")
+                    if txt and ("扫码" in txt or "二维码" in txt or "QR" in txt):
+                        return p
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    async def _switch_to_wechat_qr(self):
+        """登录弹窗在 shadow DOM 里，原生 JS 查不到——必须用 Playwright 选择器（可穿透 shadow）。
+        定位'其他登录方式'文字正下方的图标行，按视觉 x 序点第 2 个（邮箱、微信、飞书…）。"""
+        try:
+            for frame in [self.page, *self.page.frames]:
+                try:
+                    label = frame.get_by_text("其他登录方式")
+                    if not await label.count():
+                        continue
+                    lbb = await label.first.bounding_box()
+                    icons = frame.locator(
+                        '[class*="icon" i]:below(:text("其他登录方式")),'
+                        'svg:below(:text("其他登录方式")),'
+                        'img:below(:text("其他登录方式"))')
+                    n = await icons.count()
+                    if n < 3:
+                        continue
+                    # 只留弹窗内（x 在标签右侧区域）、与标签同一横带（下方100px）的图标
+                    boxed = []
+                    for i in range(n):
+                        bb = await icons.nth(i).bounding_box()
+                        if (bb and bb["width"] > 8 and lbb
+                                and 0 <= bb["y"] - lbb["y"] <= 100
+                                and bb["x"] > lbb["x"] - 40
+                                and bb["x"] < lbb["x"] + 400):
+                            boxed.append((bb["x"], i))
+                    boxed.sort()
+                    logger.info(f"[Login] 弹窗内图标 {len(boxed)} 个: {[(round(x), i) for x, i in boxed[:8]]}")
+                    # 图标顺序未知（实测第2个开的是抖音 OAuth）——逐个试错：
+                    # 点开弹窗 URL 含 weixin/wechat 即命中，否则关掉试下一个
+                    for _, idx in boxed[:5]:
+                        before = set()
+                        for pp in self._ctx.pages:
+                            before.add(id(pp))
+                        try:
+                            await icons.nth(idx).click(timeout=2500)
+                        except Exception:
+                            try:
+                                await icons.nth(idx).click(force=True, timeout=2500)
+                            except Exception:
+                                continue
+                        await self.page.wait_for_timeout(2500)
+                        hit = False
+                        for p in self._ctx.pages:
+                            try:
+                                url = p.url
+                            except Exception:
+                                continue
+                            if id(p) in before or not url:
+                                continue
+                            if "weixin" in url.lower() or "wechat" in url.lower():
+                                logger.info(f"[Login] 微信 OAuth 窗口已打开: {url[:90]}")
+                                hit = True
+                                break
+                            logger.info(f"[Login] 跳过非微信窗口: {url[:90]}")
+                            try:
+                                await p.close()
+                            except Exception:
+                                pass
+                        if hit:
+                            return True
+                    return False
+                except Exception as e:
+                    logger.info(f"[Login] wx-icon pierce err: {str(e)[:100]}")
+                    continue
+        except Exception:
+            pass
+        return False
+
+    async def _probe_login(self):
+        """主动打开登录流：点页面'登录'入口→点微信图标→截码窗。
+        返回 ("logged_in"|"need_login", qr_page or None)。"""
+        try:
+            # 首选：体验页特有的登录弹窗——点发送触发，自带"微信扫码登录"页签
+            try:
+                eframe, editor = await self.find_input()
+                if editor is not None:
+                    await editor.click(timeout=3000)
+                    await self.page.keyboard.insert_text("登录探测")
+                    await self.page.wait_for_timeout(400)
+                    send = None
+                    for frame in [self.page, *self.page.frames]:
+                        for name in ("发送", "发送消息"):
+                            loc = frame.get_by_role("button", name=name).first
+                            try:
+                                if await loc.count() and await loc.is_enabled():
+                                    send = loc
+                                    break
+                            except Exception:
+                                continue
+                        if send:
+                            break
+                    if send is not None:
+                        await send.click(timeout=3000)
+                        await self.page.wait_for_timeout(2500)
+                # 点"微信扫码"页签（Playwright 可穿透 shadow DOM）
+                for frame in [self.page, *self.page.frames]:
+                    try:
+                        tab = frame.get_by_text("微信扫码").first
+                        if await tab.count():
+                            await tab.click(timeout=3000)
+                            await self.page.wait_for_timeout(2500)
+                            logger.info("[Login] 已点'微信扫码'页签")
+                            return ("need_login", self.page)
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.info(f"[Login] send-probe err: {str(e)[:100]}")
+
+            # 兜底：右上角"登录"按钮 → 其他登录方式图标
+            for frame in [self.page, *self.page.frames]:
+                for sel in ['button:has-text("登录")', 'a:has-text("登录")']:
+                    try:
+                        loc = frame.locator(sel).first
+                        if await loc.count() and await loc.is_visible():
+                            await loc.click(timeout=3000)
+                            await self.page.wait_for_timeout(2000)
+                            await self._switch_to_wechat_qr()
+                            qr = await self._find_qr_page()
+                            return ("need_login", qr)
+                    except Exception:
+                        continue
+            # 没有独立"登录"按钮 → 已登录
+            return ("logged_in", None)
+        except Exception as e:
+            logger.warning(f"[Login] probe: {e}")
+            return ("unknown", None)
+
     async def _login_watchdog(self):
-        """未登录时循环截图二维码供扫码；登录成功后置位"""
+        """维护登录态并持续产出微信扫码截图"""
         logger.info("[Login] watchdog 启动")
         while True:
             try:
-                need = await self._needs_login()
-                if need:
-                    self.logged_in = False
-                    Path("/app/login.png").write_bytes(await self.page.screenshot())
-                    logger.info("[Login] 需要登录，二维码已更新（GET /login.png）")
-                else:
+                state, qr = await self._probe_login()
+                if state == "logged_in":
                     if not self.logged_in:
                         logger.info("[Login] 登录成功")
                     self.logged_in = True
+                else:
+                    self.logged_in = False
+                    target = qr or self.page
+                    Path("/app/login.png").write_bytes(await target.screenshot())
+                    logger.info(f"[Login] 未登录，扫码截图已更新（state={state}）")
             except Exception as e:
                 logger.warning(f"[Login] watchdog: {e}")
             await asyncio.sleep(20)
@@ -247,6 +409,46 @@ async def login_png():
     if not p.exists():
         raise HTTPException(status_code=404, detail="无登录截图（可能已登录）")
     return FileResponse(p, media_type="image/png")
+
+
+class CookiePayload(BaseModel):
+    cookie: str
+
+
+@app.post("/login/cookies")
+async def inject_cookies(payload: CookiePayload):
+    """接收浏览器整串 Cookie 头，注入容器 profile（用户在自己浏览器登录后搬迁登录态）"""
+    raw = (payload.cookie or "").strip()
+    if not raw or "=" not in raw:
+        raise HTTPException(status_code=400, detail="cookie 格式不对，应为 a=1; b=2 形式")
+    mgr = browser_manager
+    await mgr.ensure()
+    pairs = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            if k.strip():
+                pairs.append((k.strip(), v.strip()))
+    if not pairs:
+        raise HTTPException(status_code=400, detail="未解析出任何 cookie 键值对")
+    cookies = []
+    for domain in (".volcengine.com",):
+        for k, v in pairs:
+            cookies.append({"name": k, "value": v, "domain": domain, "path": "/"})
+    try:
+        await mgr._ctx.add_cookies(cookies)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"注入失败: {e}")
+    # 刷新页面让登录态生效
+    try:
+        await mgr.page.goto(page_url(ARK_MODELS[DEFAULT_MODEL]),
+                            timeout=90_000, wait_until="domcontentloaded")
+        await mgr.page.wait_for_timeout(3000)
+    except Exception:
+        pass
+    return {"ok": True, "injected": len(pairs),
+            "logged_in": mgr.logged_in, "hint": "看 healthz 的 logged_in，或直接发一条对话验证"}
 
 
 @app.get("/v1/models")

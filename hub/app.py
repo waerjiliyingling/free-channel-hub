@@ -75,9 +75,9 @@ def load_channels() -> List[dict]:
 
 @dataclass
 class Breaker:
-    threshold: int = 3
-    cooldown_s: float = 30 * 60
-    cooldown_max_s: float = 6 * 3600
+    threshold: int = int(os.getenv("BREAKER_THRESHOLD", "3"))
+    cooldown_s: float = float(os.getenv("BREAKER_COOLDOWN_S", "300"))
+    cooldown_max_s: float = float(os.getenv("BREAKER_COOLDOWN_MAX_S", "3600"))
     fails: int = 0
     trips: int = 0
     open_until: float = 0.0
@@ -121,6 +121,13 @@ class Channel:
     ok_count: int = 0
     fail_count: int = 0
     last_error: str = ""
+    # 并发闸门：单会话型上游（网页适配器只有一个浏览器实例）必须串行，
+    # 否则并发会因登录态/会话竞争直接 500。信号量让多余请求排队而不是打爆上游。
+    sem: Any = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.sem is None:
+            self.sem = asyncio.Semaphore(max(1, self.max_in_flight))
 
     def match(self, model: str) -> Optional[str]:
         """返回上游真实模型名；不服务该模型返回 None。
@@ -235,6 +242,27 @@ def admin_channels():
             for c in hub.channels]
 
 
+@app.post("/admin/reset-breaker/{name}")
+def reset_breaker_named(name: str, _=Depends(check_key)):
+    """按渠道名解除熔断。
+
+    场景：网页渠道登录态恢复后不想等冷却（默认 5 分钟起、逐次翻倍）。
+    name 传 "*" 重置全部。
+    """
+    known = {c.name for c in hub.channels}
+    if name not in known and name != "*":
+        raise HTTPException(status_code=404,
+                            detail=f"unknown channel {name}; known: {sorted(known)}")
+    hit = []
+    for c in hub.channels:
+        if name != "*" and c.name != name:
+            continue
+        c.breaker.record_success()
+        c.fail_count = 0
+        hit.append(c.name)
+    return {"reset": hit, "channels": [c.name for c in hub.channels]}
+
+
 async def probe_loop():
     """后台健康探测：把已熔断渠道的失败状态暴露出来，并做被动恢复。"""
     while True:
@@ -261,49 +289,116 @@ def _err_sse(cid: str, model: str, text: str) -> str:
                                   ensure_ascii=False) + "\n\n")
 
 
+def _sse_to_completion(raw: str, cid: str, model: str) -> dict:
+    """把上游误返的 SSE 文本聚合成标准非流式 chat.completion。
+    累加 delta.content；若出现 tool_calls 也按 OpenAI 语义合并。"""
+    content = ""
+    reasoning = ""
+    tool_calls: Dict[int, dict] = {}
+    finish = "stop"
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            d = json.loads(data)
+        except Exception:
+            continue
+        for ch in d.get("choices") or []:
+            delta = ch.get("delta") or {}
+            if delta.get("content"):
+                content += delta["content"]
+            if delta.get("reasoning_content"):
+                reasoning += delta["reasoning_content"]
+            for i, tc in enumerate(delta.get("tool_calls") or []):
+                slot = tool_calls.setdefault(tc.get("index", i),
+                                             {"id": "", "type": "function",
+                                              "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
+            if ch.get("finish_reason"):
+                finish = ch["finish_reason"]
+
+    msg: Dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = [tool_calls[k] for k in sorted(tool_calls)]
+        finish = "tool_calls" if finish == "stop" else finish
+    return {"id": cid, "object": "chat.completion", "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+
+def _rewrite_model(line: str, model: str) -> str:
+    """把 SSE 行的 model 字段改写为调用方请求的模型名。
+    解析失败时原样返回，绝不影响内容转发。"""
+    try:
+        d = json.loads(line[5:].strip())
+        if "model" in d:
+            d["model"] = model
+        return "data: " + json.dumps(d, ensure_ascii=False)
+    except Exception:
+        return line
+
+
 async def _try_stream(ch: Channel, payload: dict, cid: str, model: str):
     """单渠道流式转发。首字节前失败 -> raise（可切换渠道）；
     已发出内容后失败 -> 补错误块结束（不切换，避免内容重复）。"""
     emitted = False
-    try:
-        ch.in_flight += 1
-        async with httpx.AsyncClient(timeout=httpx.Timeout(
-                ch.first_byte_timeout_s, read=600, write=60, pool=60)) as client:
-            async with client.stream("POST", f"{ch.base_url}/v1/chat/completions",
-                                     headers={"Authorization": f"Bearer {ch.api_key}"},
-                                     json=payload) as r:
-                if r.status_code >= 500 or r.status_code in (401, 403, 404):
-                    body = (await r.aread()).decode("utf-8", "ignore")[:300]
-                    raise RuntimeError(f"upstream {r.status_code}: {body}")
-                async for line in r.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    if line.strip() == "data: [DONE]":
-                        yield line + "\n\n"
+    # 并发闸门：超出 max_in_flight 的请求在此排队，
+    # 避免并发打爆单会话型上游（网页适配器）
+    async with ch.sem:
+        try:
+            ch.in_flight += 1
+            async with httpx.AsyncClient(timeout=httpx.Timeout(
+                    ch.first_byte_timeout_s, read=600, write=60, pool=60)) as client:
+                async with client.stream("POST", f"{ch.base_url}/v1/chat/completions",
+                                         headers={"Authorization": f"Bearer {ch.api_key}"},
+                                         json=payload) as r:
+                    if r.status_code >= 500 or r.status_code in (401, 403, 404):
+                        body = (await r.aread()).decode("utf-8", "ignore")[:300]
+                        raise RuntimeError(f"upstream {r.status_code}: {body}")
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        if line.strip() == "data: [DONE]":
+                            yield line + "\n\n"
+                            ch.breaker.record_success()
+                            ch.ok_count += 1
+                            return
+                        if '"choices"' in line:
+                            emitted = True
+                            # 回写调用方请求的模型名：上游可能返回自己的内部 ID
+                            # （如元宝把 model 设成会话 ID），会导致客户端模型名漂移
+                            yield _rewrite_model(line, model) + "\n\n"
+                    if emitted:
                         ch.breaker.record_success()
                         ch.ok_count += 1
-                        return
-                    if '"choices"' in line:
-                        emitted = True
-                        yield line + "\n\n"
-                if emitted:
-                    ch.breaker.record_success()
-                    ch.ok_count += 1
-                    yield "data: [DONE]\n\n"
-                else:
-                    raise RuntimeError("upstream closed without content")
-    except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout,
-            httpx.RemoteProtocolError, RuntimeError) as e:
-        ch.breaker.record_fail(time.time())
-        ch.fail_count += 1
-        ch.last_error = f"{type(e).__name__}: {e}"
-        if emitted:
-            yield _err_sse(cid, model, f"\n[hub] 渠道 {ch.name} 中途失败: {e}")
-            yield "data: [DONE]\n\n"
-        else:
-            raise
-    finally:
-        ch.in_flight -= 1
+                        yield "data: [DONE]\n\n"
+                    else:
+                        raise RuntimeError("upstream closed without content")
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout,
+                httpx.RemoteProtocolError, RuntimeError) as e:
+            ch.breaker.record_fail(time.time())
+            ch.fail_count += 1
+            ch.last_error = f"{type(e).__name__}: {e}"
+            if emitted:
+                yield _err_sse(cid, model, f"\n[hub] 渠道 {ch.name} 中途失败: {e}")
+                yield "data: [DONE]\n\n"
+            else:
+                raise
+        finally:
+            ch.in_flight -= 1
 
 
 @app.post("/v1/chat/completions")
@@ -367,36 +462,49 @@ async def chat(request: Request, _=Depends(check_key)):
         payload["model"] = real_model
         payload["stream"] = False
         try:
-            ch.in_flight += 1
-            async with httpx.AsyncClient(timeout=httpx.Timeout(
-                    ch.first_byte_timeout_s, read=600, write=60, pool=60)) as client:
-                r = await client.post(f"{ch.base_url}/v1/chat/completions",
-                                      headers={"Authorization": f"Bearer {ch.api_key}"},
-                                      json=payload)
-                if r.status_code >= 500 or r.status_code in (401, 403, 404):
-                    raise RuntimeError(f"upstream {r.status_code}: {r.text[:300]}")
-                ch.breaker.record_success()
-                ch.ok_count += 1
-                hub.set_sticky(fp, ch.name)
+            # 并发闸门：单会话型上游必须串行
+            async with ch.sem:
+                ch.in_flight += 1
                 try:
-                    data = r.json()
-                    data["model"] = model      # 回写请求方用的模型名
-                    return JSONResponse(data)
-                except Exception:
-                    return JSONResponse({"id": cid, "object": "chat.completion",
-                                         "created": int(time.time()), "model": model,
-                                         "choices": [{"index": 0, "message":
-                                                      {"role": "assistant", "content": r.text},
-                                                      "finish_reason": "stop"}],
-                                         "usage": {"prompt_tokens": 0, "completion_tokens": 0,
-                                                   "total_tokens": 0}})
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(
+                            ch.first_byte_timeout_s, read=600, write=60,
+                            pool=60)) as client:
+                        r = await client.post(f"{ch.base_url}/v1/chat/completions",
+                                              headers={"Authorization": f"Bearer {ch.api_key}"},
+                                              json=payload)
+                        if r.status_code >= 500 or r.status_code in (401, 403, 404):
+                            raise RuntimeError(
+                                f"upstream {r.status_code}: {r.text[:300]}")
+                        ch.breaker.record_success()
+                        ch.ok_count += 1
+                        hub.set_sticky(fp, ch.name)
+                        raw = r.text
+                        # 兼容性归一化：有些上游（如元宝网页版）无视 stream:false，
+                        # 仍然返回 SSE 文本。此时解析出正文再包成标准 JSON，
+                        # 否则调用方会收到一串 "data: {...}" 原始文本。
+                        if raw.lstrip().startswith("data:"):
+                            return JSONResponse(
+                                _sse_to_completion(raw, cid, model))
+                        try:
+                            data = r.json()
+                            data["model"] = model   # 回写请求方用的模型名
+                            return JSONResponse(data)
+                        except Exception:
+                            return JSONResponse({
+                                "id": cid, "object": "chat.completion",
+                                "created": int(time.time()), "model": model,
+                                "choices": [{"index": 0, "message":
+                                             {"role": "assistant", "content": raw},
+                                             "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                                          "total_tokens": 0}})
+                finally:
+                    ch.in_flight -= 1
         except Exception as e:
             ch.breaker.record_fail(time.time())
             ch.fail_count += 1
             ch.last_error = f"{type(e).__name__}: {e}"
             logger.warning(f"[Failover] {ch.name}: {e}")
-        finally:
-            ch.in_flight -= 1
 
     raise HTTPException(status_code=502, detail=f"all channels failed: {attempts}")
 

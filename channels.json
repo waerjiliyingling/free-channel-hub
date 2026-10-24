@@ -1,10 +1,12 @@
 [
   {
+    "_comment": "网页版渠道：底层是单浏览器实例，max_in_flight 必须为 1（hub 会排队串行）",
     "name": "qianwen-web",
     "base_url": "http://qianwen-free-api:8000",
     "api_key": "sk-qianwen-local-2026",
     "models": ["qwen3.8-max", "qwen3.8-plus", "qwen*"],
-    "weight": 1
+    "weight": 1,
+    "max_in_flight": 1
   },
   {
     "name": "yuanbao-web",
@@ -23,14 +25,16 @@
       "deepseek*",
       "free-chat=hunyuan"
     ],
-    "weight": 1
+    "weight": 1,
+    "max_in_flight": 1
   },
   {
     "name": "ark-web",
     "base_url": "http://ark-free-api:8000",
     "api_key": "sk-ark-local-2026",
     "models": ["deepseek-v4.1-flash", "deepseek*", "doubao*"],
-    "weight": 1
+    "weight": 1,
+    "max_in_flight": 1
   },
 
   {

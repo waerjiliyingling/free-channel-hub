@@ -273,9 +273,23 @@ async def run_chat(prompt: str) -> AsyncGenerator[str, None]:
             await page.wait_for_timeout(POLL_MS)
 
         if not done:
+            # 区分"真的超时"和"上游明确报错"：后者是额度/登录态问题，
+            # 给出可操作的提示，而不是一句难懂的 TimeoutError
+            tail = await page.evaluate(
+                "() => (document.body.innerText || '').slice(-600)")
+            if "访客体验次数" in tail or "前往登录" in tail:
+                raise RuntimeError(
+                    "千问免登录访客额度已用尽（页面提示『访客体验次数仅剩 N 次』）。"
+                    "该渠道为匿名试用，有次数上限，请改用官方 API 渠道"
+                    "（ModelScope / DashScope 等）或登录后重试。")
+            if "SSE_TRANSPORT" in tail or "网络连接中断" in tail:
+                raise RuntimeError(
+                    "千问网页版 SSE 连接被服务端切断（错误码 SSE_TRANSPORT），"
+                    "通常是匿名试用被限流或额度耗尽。请稍后重试或改用官方 API 渠道。")
             raise TimeoutError("等待回复超时")
         if not last:
-            sample = (await page.evaluate("() => (document.body.innerText || '').slice(-400)"))
+            sample = await page.evaluate(
+                "() => (document.body.innerText || '').slice(-400)")
             logger.error(f"[Chat] 空回复诊断，页面尾部: {sample!r}")
             raise RuntimeError("回复内容为空")
         logger.info(f"[Chat] 装载 {t_load:.1f}s | 首字 {first_chunk_at}s | "
@@ -301,6 +315,32 @@ app = FastAPI(title="qianwen-free-api", version="0.2.0", lifespan=lifespan)
 def check_key(auth: HTTPAuthorizationCredentials = Depends(bearer)):
     if not auth or auth.credentials not in API_KEYS:
         raise HTTPException(status_code=403, detail="invalid api_key")
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "qianwen-free-api",
+            "page_ready": manager.page is not None,
+            "note": "免登录渠道有访客额度上限，见 /debug/quota"}
+
+
+@app.get("/debug/quota")
+async def debug_quota(_=Depends(check_key)):
+    """读取页面上的访客剩余体验次数，用于提前发现额度耗尽。"""
+    try:
+        page = await manager.ensure()
+        tail = await page.evaluate(
+            "() => (document.body.innerText || '').slice(-600)")
+        quota = None
+        for line in tail.split("\n"):
+            if "访客体验次数" in line:
+                quota = line.strip()
+                break
+        return {"quota_line": quota,
+                "exhausted": bool(quota and "仅剩 0 次" in quota),
+                "needs_login": "前往登录" in tail}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/v1/models")
