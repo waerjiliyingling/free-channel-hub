@@ -1,0 +1,50 @@
+# free-channel-hub —— 免费网页版大模型多渠道聚合（熔断 + 负载均衡）
+# 独立可运行副本；生产栈见 AI_doc\ai-gateway-stack\docker-compose.yml
+name: free-channel-hub
+
+services:
+  ark-free-api:            # 火山方舟体验页（需扫码登录，GET http://127.0.0.1:8110/login.png）
+    build: ./ark-free-api
+    container_name: ark-free-api
+    restart: unless-stopped
+    ports:
+      - "8110:8000"
+    environment:
+      - API_KEYS=sk-ark-local-2026
+      # 可选：填官方 ARK_API_KEY 则该服务变为纯 API 转发（不再要网页登录）
+      # - ARK_API_KEY=
+    volumes:
+      - ./ark-data/browser-profile:/app/browser-profile
+
+  qianwen-free-api:        # 千问 try-ai 免登录（自制）
+    build: ./qianwen-free-api
+    container_name: qianwen-free-api
+    restart: unless-stopped
+    ports:
+      - "8109:8000"
+    environment:
+      - API_KEYS=sk-qianwen-local-2026
+    volumes:
+      - ./qianwen-data/browser-profile:/app/browser-profile
+
+  # 可选：腾讯元宝（第三方 chenwr727/yuanbao-free-api，另建目录后取消注释）
+  # yuanbao-free-api:
+  #   build: ./yuanbao-free-api
+  #   container_name: yuanbao-free-api
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8108:8000"
+
+  hub:                     # 熔断 + 负载均衡入口
+    build: ./hub
+    container_name: free-channel-hub
+    restart: unless-stopped
+    ports:
+      - "8111:8000"
+    environment:
+      - HUB_API_KEYS=sk-hub-local-2026
+      # 渠道表：同 compose 网络内用服务名互访；含一个演示用死渠道
+      - CHANNELS_JSON=[{"name":"ark-web","base_url":"http://ark-free-api:8000","api_key":"sk-ark-local-2026","models":["deepseek-v4.1-flash"],"weight":1},{"name":"qianwen-web","base_url":"http://qianwen-free-api:8000","api_key":"sk-qianwen-local-2026","models":["qwen3.8-max","free-chat"],"weight":1},{"name":"yuanbao-web","base_url":"http://yuanbao-free-api:8000","api_key":"sk-yuanbao-local-2026","models":["deepseek-v3","deepseek-r1","hunyuan","hunyuan-t1","free-chat"],"weight":1},{"name":"dead-demo","base_url":"http://127.0.0.1:9","api_key":"x","models":["brk-test","free-chat"],"weight":1}]
+    depends_on:
+      - ark-free-api
+      - qianwen-free-api

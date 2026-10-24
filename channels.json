@@ -1,0 +1,146 @@
+[
+  {
+    "name": "qianwen-web",
+    "base_url": "http://qianwen-free-api:8000",
+    "api_key": "sk-qianwen-local-2026",
+    "models": ["qwen3.8-max", "qwen3.8-plus", "qwen*"],
+    "weight": 1
+  },
+  {
+    "name": "yuanbao-web",
+    "base_url": "http://yuanbao-free-api:8000",
+    "api_key": "sk-yuanbao-local-2026",
+    "models": [
+      "hunyuan",
+      "hunyuan-t1",
+      "hunyuan-search",
+      "hunyuan-t1-search",
+      "deepseek-v3",
+      "deepseek-r1",
+      "deepseek-v3-search",
+      "deepseek-r1-search",
+      "hunyuan*",
+      "deepseek*",
+      "free-chat=hunyuan"
+    ],
+    "weight": 1
+  },
+  {
+    "name": "ark-web",
+    "base_url": "http://ark-free-api:8000",
+    "api_key": "sk-ark-local-2026",
+    "models": ["deepseek-v4.1-flash", "deepseek*", "doubao*"],
+    "weight": 1
+  },
+
+  {
+    "_comment": "===== 以下为官方 API 渠道：设置对应环境变量后才启用 =====",
+    "name": "gemini",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "api_key": "",
+    "env_key": "GEMINI_API_KEY",
+    "models": ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-3-flash", "gemini*"],
+    "weight": 2
+  },
+  {
+    "name": "modelscope",
+    "base_url": "https://api-inference.modelscope.cn/v1",
+    "api_key": "",
+    "env_key": "MODELSCOPE_API_KEY",
+    "models": [
+      "deepseek-ai/DeepSeek-V4.1-Flash",
+      "deepseek-ai/DeepSeek-V4-Pro",
+      "Qwen/Qwen3.8-27B",
+      "Qwen/Qwen3.5-397B-A17B",
+      "ZhipuAI/GLM-5.2",
+      "ZhipuAI/GLM-4.7-Flash",
+      "stepfun-ai/Step-5-Preview",
+      "stepfun-ai/Step-3.7-Flash",
+      "MiniMax/MiniMax-M3",
+      "MiniMax/MiniMax-M1-80k",
+      "PaddlePaddle/ERNIE-4.5-21B-A3B-PT",
+      "PaddlePaddle/ERNIE-4.5-300B-A47B-PT",
+      "Shanghai_AI_Laboratory/Intern-S1",
+      "Qwen/*", "ZhipuAI/*", "stepfun-ai/*", "MiniMax/*", "deepseek-ai/*"
+    ],
+    "weight": 3
+  },
+  {
+    "name": "zhipu-glm",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "api_key": "",
+    "env_key": "ZHIPU_API_KEY",
+    "models": ["glm-4.7", "glm-4.7-flash", "glm-4.6", "glm-4.5-air", "glm*"],
+    "weight": 2
+  },
+  {
+    "name": "dashscope",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key": "",
+    "env_key": "DASHSCOPE_API_KEY",
+    "models": ["qwen-max", "qwen-plus", "qwen-turbo", "qwen3-max", "qwen*"],
+    "weight": 2
+  },
+  {
+    "name": "stepfun",
+    "base_url": "https://api.stepfun.com/v1",
+    "api_key": "",
+    "env_key": "STEPFUN_API_KEY",
+    "models": ["step-3", "step-2-16k", "step*"],
+    "weight": 2
+  },
+  {
+    "name": "minimax",
+    "base_url": "https://api.minimax.chat/v1",
+    "api_key": "",
+    "env_key": "MINIMAX_API_KEY",
+    "models": ["minimax-text-01", "MiniMax-M1", "minimax*"],
+    "weight": 2
+  },
+  {
+    "name": "moonshot",
+    "base_url": "https://api.moonshot.cn/v1",
+    "api_key": "",
+    "env_key": "MOONSHOT_API_KEY",
+    "models": ["kimi-k2-0905-preview", "kimi-latest", "moonshot-v1-8k", "kimi*", "moonshot*"],
+    "weight": 2
+  },
+  {
+    "name": "hunyuan",
+    "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
+    "api_key": "",
+    "env_key": "HUNYUAN_API_KEY",
+    "models": ["hunyuan-turbos-latest", "hunyuan-t1-latest", "hunyuan*"],
+    "weight": 2
+  },
+  {
+    "name": "xiaomi-mimo",
+    "base_url": "https://api.xiaomimimo.com/v1",
+    "api_key": "",
+    "env_key": "XIAOMI_API_KEY",
+    "models": ["mimo-v2", "mimo*"],
+    "weight": 2
+  },
+  {
+    "name": "openrouter",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key": "",
+    "env_key": "OPENROUTER_API_KEY",
+    "models": [
+      "google/gemma-4-31b-it:free",
+      "nvidia/nemotron-3-super-120b-a12b:free",
+      "xingchen-agi/xing4.0-29b-a4b:free",
+      "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "*:free"
+    ],
+    "weight": 1
+  },
+  {
+    "name": "siliconflow",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key": "",
+    "env_key": "SILICONFLOW_API_KEY",
+    "models": ["Qwen/Qwen3-8B", "deepseek-ai/DeepSeek-V3", "THUDM/glm-4-9b-chat", "*/*"],
+    "weight": 2
+  }
+]
